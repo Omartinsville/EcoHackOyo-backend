@@ -1,0 +1,250 @@
+-- ============================================================================
+-- EcoHackOyo 2026 — Postgres schema
+-- Covers: hackathon contestant registration, main summit attendee
+-- registration, sponsor/partner registration, and slot-capacity control.
+--
+-- Target: Postgres 14+. Tested against the extension set available on
+-- Neon / Supabase / RDS / Railway managed Postgres.
+-- ============================================================================
+
+-- ---------------------------------------------------------------------------
+-- EXTENSIONS
+-- ---------------------------------------------------------------------------
+-- gen_random_uuid() for primary keys
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+-- case-insensitive email column (so "Name@x.com" and "name@x.com" collide)
+CREATE EXTENSION IF NOT EXISTS citext;
+
+-- ---------------------------------------------------------------------------
+-- ENUMS — constrain values at the database layer, not just in app code.
+-- Using enums instead of free-text keeps bad data out and makes admin
+-- queries/filters (GROUP BY category, WHERE status = ...) cheap and exact.
+-- ---------------------------------------------------------------------------
+CREATE TYPE hackathon_role AS ENUM (
+  'student', 'young_entrepreneur', 'tech_digital_innovator',
+  'developer_designer', 'researcher', 'creative_problem_solver', 'other'
+);
+
+CREATE TYPE challenge_area AS ENUM (
+  'youth_employment', 'entrepreneurship_msmes', 'agriculture_agribusiness',
+  'digital_economy', 'education_skills_development', 'financial_inclusion',
+  'sustainability', 'local_economic_development', 'creative_economy',
+  'technology_innovation'
+);
+
+CREATE TYPE team_status AS ENUM ('solo', 'has_team');
+
+-- Shared status lifecycle for hackathon applicants
+CREATE TYPE registration_status AS ENUM (
+  'pending', 'confirmed', 'waitlisted', 'rejected', 'cancelled'
+);
+
+CREATE TYPE summit_category AS ENUM (
+  'student_youth', 'entrepreneur_business_owner', 'innovator_creative',
+  'community_builder', 'policy_maker_government', 'investor_sponsor_rep', 'other'
+);
+
+CREATE TYPE contestant_flag AS ENUM ('no', 'yes', 'interested');
+
+CREATE TYPE sponsor_tier AS ENUM (
+  'exhibition_in_kind', 'gold', 'platinum', 'not_sure'
+);
+
+CREATE TYPE sponsor_status AS ENUM (
+  'new', 'contacted', 'in_discussion', 'confirmed', 'declined'
+);
+
+-- ---------------------------------------------------------------------------
+-- HELPER: auto-maintain updated_at on every UPDATE
+-- ---------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION set_updated_at()
+RETURNS TRIGGER AS $$
+BEGIN
+  NEW.updated_at = now();
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- ============================================================================
+-- TABLE 1 — HACKATHON CONTESTANT REGISTRATIONS
+-- ============================================================================
+CREATE TABLE hackathon_registrations (
+  id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+
+  full_name        TEXT NOT NULL CHECK (char_length(full_name) BETWEEN 2 AND 120),
+  email            CITEXT NOT NULL,
+  phone            TEXT NOT NULL CHECK (char_length(phone) BETWEEN 7 AND 20),
+  age              SMALLINT NOT NULL CHECK (age BETWEEN 15 AND 99),
+  location         TEXT NOT NULL CHECK (char_length(location) BETWEEN 2 AND 120),
+
+  role             hackathon_role NOT NULL,
+  challenge_area   challenge_area NOT NULL,
+  team_status      team_status NOT NULL DEFAULT 'solo',
+  team_name        TEXT,
+  idea_summary     TEXT CHECK (char_length(idea_summary) <= 1000),
+  referral_source  TEXT,
+
+  consent          BOOLEAN NOT NULL DEFAULT FALSE CHECK (consent IS TRUE),
+  status           registration_status NOT NULL DEFAULT 'pending',
+
+  -- basic anti-abuse metadata — not personal data, just operational
+  source_ip        INET,
+  user_agent       TEXT,
+
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+  UNIQUE (email)   -- one registration per person; resubmission = update, not a new row
+);
+
+CREATE TRIGGER trg_hackathon_updated_at
+  BEFORE UPDATE ON hackathon_registrations
+  FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- Indexes: only what the admin dashboard / ops queries actually need.
+CREATE INDEX idx_hackathon_status       ON hackathon_registrations (status);
+CREATE INDEX idx_hackathon_challenge    ON hackathon_registrations (challenge_area);
+CREATE INDEX idx_hackathon_created_at   ON hackathon_registrations (created_at DESC);
+-- Fast "who's still pending review" queue
+CREATE INDEX idx_hackathon_pending      ON hackathon_registrations (created_at)
+  WHERE status = 'pending';
+
+-- ============================================================================
+-- TABLE 2 — MAIN SUMMIT ATTENDEE REGISTRATIONS
+-- ============================================================================
+CREATE TABLE summit_registrations (
+  id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+
+  full_name        TEXT NOT NULL CHECK (char_length(full_name) BETWEEN 2 AND 120),
+  email            CITEXT NOT NULL,
+  phone            TEXT NOT NULL CHECK (char_length(phone) BETWEEN 7 AND 20),
+
+  category         summit_category NOT NULL,
+  organization     TEXT,
+  also_contestant  contestant_flag NOT NULL DEFAULT 'no',
+  expectations     TEXT CHECK (char_length(expectations) <= 800),
+
+  consent          BOOLEAN NOT NULL DEFAULT FALSE CHECK (consent IS TRUE),
+
+  -- did they actually show up? useful for post-event reporting to sponsors
+  checked_in_at    TIMESTAMPTZ,
+
+  source_ip        INET,
+  user_agent       TEXT,
+
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+  UNIQUE (email)
+);
+
+CREATE TRIGGER trg_summit_updated_at
+  BEFORE UPDATE ON summit_registrations
+  FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+CREATE INDEX idx_summit_category    ON summit_registrations (category);
+CREATE INDEX idx_summit_created_at  ON summit_registrations (created_at DESC);
+-- Fast day-of check-in lookup by email at the door
+CREATE INDEX idx_summit_email_lower ON summit_registrations (email);
+
+-- ============================================================================
+-- TABLE 3 — SPONSOR / PARTNER REGISTRATIONS
+-- ============================================================================
+CREATE TABLE sponsor_registrations (
+  id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+
+  organization_name TEXT NOT NULL CHECK (char_length(organization_name) BETWEEN 2 AND 150),
+  contact_name      TEXT NOT NULL CHECK (char_length(contact_name) BETWEEN 2 AND 120),
+  contact_role      TEXT NOT NULL,
+  email             CITEXT NOT NULL,
+  phone             TEXT NOT NULL CHECK (char_length(phone) BETWEEN 7 AND 20),
+  website           TEXT,
+
+  tier              sponsor_tier NOT NULL,
+  message           TEXT CHECK (char_length(message) <= 1000),
+
+  consent           BOOLEAN NOT NULL DEFAULT FALSE CHECK (consent IS TRUE),
+  status            sponsor_status NOT NULL DEFAULT 'new',
+
+  source_ip         INET,
+  user_agent        TEXT,
+
+  created_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+  UNIQUE (organization_name, email)  -- same org can re-inquire under a different contact
+);
+
+CREATE TRIGGER trg_sponsor_updated_at
+  BEFORE UPDATE ON sponsor_registrations
+  FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+CREATE INDEX idx_sponsor_status      ON sponsor_registrations (status);
+CREATE INDEX idx_sponsor_tier        ON sponsor_registrations (tier);
+CREATE INDEX idx_sponsor_created_at  ON sponsor_registrations (created_at DESC);
+
+-- ============================================================================
+-- CAPACITY CONTROL — the flyer promises "500 slots only" for the hackathon.
+-- A plain COUNT(*) check-then-insert from the app has a race condition: two
+-- people submitting in the same instant can both pass the check and both
+-- get inserted, overselling the cohort. This singleton row + row lock makes
+-- "reserve a slot" a single atomic statement.
+-- ============================================================================
+CREATE TABLE hackathon_capacity (
+  id           BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (id),  -- forces exactly one row
+  total_slots  INT NOT NULL DEFAULT 500,
+  slots_taken  INT NOT NULL DEFAULT 0 CHECK (slots_taken BETWEEN 0 AND total_slots)
+);
+
+INSERT INTO hackathon_capacity (id, total_slots, slots_taken) VALUES (TRUE, 500, 0);
+
+-- How the API uses this (see backend/server.js):
+--   BEGIN;
+--   UPDATE hackathon_capacity
+--     SET slots_taken = slots_taken + 1
+--     WHERE slots_taken < total_slots
+--     RETURNING slots_taken;
+--   -- 0 rows returned => sold out, ROLLBACK and respond 409
+--   INSERT INTO hackathon_registrations (...) VALUES (...);
+--   COMMIT;
+--
+-- The UPDATE takes a row lock, so concurrent submissions are serialized —
+-- no oversell is possible even under a traffic spike, and the CHECK
+-- constraint is a hard backstop even if application code has a bug.
+
+-- ============================================================================
+-- REPORTING VIEWS — cheap read-only shortcuts for an admin dashboard
+-- ============================================================================
+CREATE VIEW v_hackathon_summary AS
+SELECT
+  status,
+  challenge_area,
+  count(*) AS total
+FROM hackathon_registrations
+GROUP BY status, challenge_area;
+
+CREATE VIEW v_capacity_status AS
+SELECT
+  total_slots,
+  slots_taken,
+  total_slots - slots_taken AS slots_remaining,
+  round(100.0 * slots_taken / total_slots, 1) AS percent_full
+FROM hackathon_capacity;
+
+-- ============================================================================
+-- NOTES
+-- ============================================================================
+-- 1. UNIQUE(email) per table means "already registered" is enforced by
+--    Postgres itself (error code 23505), not just app logic — resubmitting
+--    the same form should be treated as an update (UPSERT), see server.js.
+-- 2. citext gives case-insensitive + accent-sensitive equality on email
+--    without needing lower(email) everywhere in app code or indexes.
+-- 3. Enums instead of free text: rejects bad values at the DB layer, and
+--    keeps GROUP BY / dashboard queries exact (no "Student " vs "student"
+--    vs "STUDENT" drift that free text always accumulates).
+-- 4. No foreign keys between the three tables: a hackathon contestant and a
+--    summit attendee are recorded independently by design (the summit form
+--    already asks "are you also a contestant?" as a plain field). At this
+--    scale (hundreds–low thousands of rows) a shared "contacts" table adds
+--    join complexity without a real performance or integrity benefit — add
+--    one later only if you build a CRM-style dedup view across forms.
