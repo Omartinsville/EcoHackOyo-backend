@@ -1,11 +1,12 @@
 // EcoHackOyo API — minimal, production-lean Express server in front of Postgres.
 // Handles the 3 registration forms: hackathon, summit, sponsor.
-require('dotenv').config();
+
 const express = require("express");
 const helmet = require("helmet");
 const cors = require("cors");
 const rateLimit = require("express-rate-limit");
 const { Pool } = require("pg");
+
 const app = express();
 
 // ---------------------------------------------------------------------------
@@ -20,7 +21,7 @@ const pool = new Pool({
   max: Number(process.env.PG_POOL_MAX || 8),
   idleTimeoutMillis: 30_000,
   connectionTimeoutMillis: 5_000,
-  ssl: process.env.PGSSL === "true" ? true : { rejectUnauthorized: false }
+  ssl: process.env.PGSSL === "false" ? false : { rejectUnauthorized: false }
 });
 
 // ---------------------------------------------------------------------------
@@ -99,55 +100,82 @@ app.post("/api/register/hackathon", async (req, res) => {
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
+    const email = b.email.toLowerCase();
 
-    // Atomically reserve a slot. See schema.sql for why this must be a
-    // single UPDATE ... WHERE ... RETURNING rather than count-then-insert.
-    const capacity = await client.query(
-      `UPDATE hackathon_capacity
-         SET slots_taken = slots_taken + 1
-         WHERE slots_taken < total_slots
-         RETURNING slots_taken, total_slots`
+    // An edit/resubmit (same email) must NOT consume another slot or get a
+    // new participant number — only genuinely new emails touch capacity.
+    const existing = await client.query(
+      `SELECT id FROM hackathon_registrations WHERE email = $1`,
+      [email]
     );
-    if (capacity.rowCount === 0) {
-      await client.query("ROLLBACK");
-      return res.status(409).json({ error: "The hackathon is full. You've been noted for the waitlist." });
+
+    let row;
+    if (existing.rowCount > 0) {
+      const updated = await client.query(
+        `UPDATE hackathon_registrations SET
+           full_name = $1, phone = $2, age = $3, location = $4, role = $5,
+           challenge_area = $6, team_status = $7, team_name = $8,
+           idea_summary = $9, referral_source = $10, updated_at = now()
+         WHERE email = $11
+         RETURNING id, participant_no, participant_code`,
+        [
+          clamp(b.full_name, 120), clamp(b.phone, 20), age, clamp(b.location, 120),
+          b.role, b.challenge_area, b.team_status === "has_team" ? "has_team" : "solo",
+          clamp(b.team_name, 80) || null, clamp(b.idea_summary, 1000) || null,
+          clamp(b.referral_source, 120) || null, email
+        ]
+      );
+      row = updated.rows[0];
+    } else {
+      // Atomically reserve a slot. See schema.sql for why this must be a
+      // single UPDATE ... WHERE ... RETURNING rather than count-then-insert.
+      // The returned slots_taken doubles as this person's participant_no.
+      const capacity = await client.query(
+        `UPDATE hackathon_capacity
+           SET slots_taken = slots_taken + 1
+           WHERE slots_taken < total_slots
+           RETURNING slots_taken`
+      );
+      if (capacity.rowCount === 0) {
+        await client.query("ROLLBACK");
+        return res.status(409).json({ error: "The hackathon is full. You've been noted for the waitlist." });
+      }
+      const participantNo = capacity.rows[0].slots_taken;
+
+      const inserted = await client.query(
+        `INSERT INTO hackathon_registrations
+           (full_name, email, phone, age, location, role, challenge_area,
+            team_status, team_name, idea_summary, referral_source, consent,
+            participant_no, source_ip, user_agent)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+         RETURNING id, participant_no, participant_code`,
+        [
+          clamp(b.full_name, 120), email, clamp(b.phone, 20), age,
+          clamp(b.location, 120), b.role, b.challenge_area,
+          b.team_status === "has_team" ? "has_team" : "solo",
+          clamp(b.team_name, 80) || null, clamp(b.idea_summary, 1000) || null,
+          clamp(b.referral_source, 120) || null, true,
+          participantNo, req.ip, req.get("user-agent") || null
+        ]
+      );
+      row = inserted.rows[0];
     }
 
-    const insert = await client.query(
-      `INSERT INTO hackathon_registrations
-         (full_name, email, phone, age, location, role, challenge_area,
-          team_status, team_name, idea_summary, referral_source, consent,
-          source_ip, user_agent)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
-       ON CONFLICT (email) DO UPDATE SET
-         full_name = EXCLUDED.full_name,
-         phone = EXCLUDED.phone,
-         age = EXCLUDED.age,
-         location = EXCLUDED.location,
-         role = EXCLUDED.role,
-         challenge_area = EXCLUDED.challenge_area,
-         team_status = EXCLUDED.team_status,
-         team_name = EXCLUDED.team_name,
-         idea_summary = EXCLUDED.idea_summary,
-         updated_at = now()
-       RETURNING id`,
-      [
-        clamp(b.full_name, 120), b.email.toLowerCase(), clamp(b.phone, 20), age,
-        clamp(b.location, 120), b.role, b.challenge_area,
-        b.team_status === "has_team" ? "has_team" : "solo",
-        clamp(b.team_name, 80) || null, clamp(b.idea_summary, 1000) || null,
-        clamp(b.referral_source, 120) || null, true,
-        req.ip, req.get("user-agent") || null
-      ]
-    );
-
     await client.query("COMMIT");
-    return res.status(201).json({ ok: true, id: insert.rows[0].id });
+    return res.status(201).json({
+      ok: true,
+      id: row.id,
+      participant_no: row.participant_no,
+      participant_code: row.participant_code,
+      whatsapp_link: process.env.WHATSAPP_HACKATHON_LINK || null
+    });
   } catch (err) {
-    await client.query("ROLLBACK");
+    await client.query("ROLLBACK"); // undoes the capacity increment too, if one happened
     if (err.code === "23505") {
-      // Shouldn't hit this given ON CONFLICT above, but kept as a safety net
-      return res.status(200).json({ ok: true, note: "Registration already existed and was updated." });
+      // Two submissions for the same brand-new email landed at once — one
+      // won, this one lost the race. Nothing was left inconsistent because
+      // the ROLLBACK above reverted its capacity increment.
+      return res.status(200).json({ ok: true, note: "You're already registered — no changes needed." });
     }
     console.error("hackathon registration error:", err);
     return res.status(500).json({ error: "Something went wrong. Please try again." });
@@ -199,7 +227,11 @@ app.post("/api/register/summit", async (req, res) => {
         req.ip, req.get("user-agent") || null
       ]
     );
-    return res.status(201).json({ ok: true, id: insert.rows[0].id });
+    return res.status(201).json({
+      ok: true,
+      id: insert.rows[0].id,
+      whatsapp_link: process.env.WHATSAPP_SUMMIT_LINK || null
+    });
   } catch (err) {
     console.error("summit registration error:", err);
     return res.status(500).json({ error: "Something went wrong. Please try again." });
