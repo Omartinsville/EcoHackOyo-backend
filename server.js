@@ -8,6 +8,7 @@ const rateLimit = require("express-rate-limit");
 const { Pool } = require("pg");
 
 const app = express();
+app.set('trust proxy', 1);
 
 // ---------------------------------------------------------------------------
 // DB POOL
@@ -18,11 +19,13 @@ const app = express();
 // ---------------------------------------------------------------------------
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
+  ssl: {
+    rejectUnauthorized: true,
+  },
   max: Number(process.env.PG_POOL_MAX || 8),
   idleTimeoutMillis: 30_000,
   connectionTimeoutMillis: 5_000,
-  ssl: process.env.PGSSL === "false" ? false : { rejectUnauthorized: false }
-});
+ });
 
 // ---------------------------------------------------------------------------
 // MIDDLEWARE
@@ -35,7 +38,6 @@ app.use(
     methods: ["POST"]
   })
 );
-
 // Generic rate limit: protects the DB from bot floods hitting a public form.
 // 500 hackathon slots means legitimate traffic is naturally low-volume.
 const formLimiter = rateLimit({
