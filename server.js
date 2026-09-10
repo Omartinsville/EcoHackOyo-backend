@@ -34,8 +34,9 @@ app.use(helmet());
 app.use(express.json({ limit: "20kb" })); // registration payloads are tiny
 app.use(
   cors({
-    origin: (process.env.ALLOWED_ORIGIN || "").split(",").filter(Boolean),
-    methods: ["POST"]
+    origin: ["https://ecohackoyo.netlify.app", "http://localhost:3000"],
+    methods: ["GET","POST","OPTIONS"],
+    allowedHeaders:["Content-type"]
   })
 );
 // Generic rate limit: protects the DB from bot floods hitting a public form.
